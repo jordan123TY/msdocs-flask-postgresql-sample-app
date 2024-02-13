@@ -1,123 +1,66 @@
-import os
-from datetime import datetime
+from flask import Flask, redirect, url_for, session
+import msal
+import uuid
 
-from flask import Flask, redirect, render_template, request, send_from_directory, url_for
-from flask_migrate import Migrate
-from flask_sqlalchemy import SQLAlchemy
-from flask_wtf.csrf import CSRFProtect
+app = Flask(__name__)
+app.config.from_object(__name__)
+app.config['SECRET_KEY'] = 'un_secret_tres_secret'  # Devrait être un secret aléatoire
+app.config['SESSION_TYPE'] = 'filesystem'
 
+# Configurez ces valeurs avec celles de votre application Azure B2C
+app.config['B2C_TENANT'] = "ab39bc97-fa3e-44e9-a2c6-e0f1aa8183f7"
+app.config['B2C_CLIENT_ID'] = "3c0393e1-d9ea-4d48-84b7-a1f4c3f5c98c"
+app.config['B2C_CLIENT_SECRET'] = "x9E8Q~3c7z12nfit7JCs4w5VI7D7uZmVB_Db_a17"
+app.config['B2C_REDIRECT_URI'] = "https://application-test-bluink.azurewebsites.net"  # Changez pour votre URL de production
+app.config['B2C_AUTHORITY'] = "https://DevopsCoffee.b2clogin.com/DevopsCoffee.onmicrosoft.com/B2C_1_signupsignin1"
 
-app = Flask(__name__, static_folder='static')
-csrf = CSRFProtect(app)
-
-# WEBSITE_HOSTNAME exists only in production environment
-if 'WEBSITE_HOSTNAME' not in os.environ:
-    # local development, where we'll use environment variables
-    print("Loading config.development and environment variables from .env file.")
-    app.config.from_object('azureproject.development')
-else:
-    # production
-    print("Loading config.production.")
-    app.config.from_object('azureproject.production')
-
-app.config.update(
-    SQLALCHEMY_DATABASE_URI=app.config.get('DATABASE_URI'),
-    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+# Créez une instance MSAL
+msal_app = msal.ConfidentialClientApplication(
+    app.config['B2C_CLIENT_ID'],
+    authority=app.config['B2C_AUTHORITY'],
+    client_credential=app.config['B2C_CLIENT_SECRET'],
 )
 
-# Initialize the database connection
-db = SQLAlchemy(app)
-
-# Enable Flask-Migrate commands "flask db init/migrate/upgrade" to work
-migrate = Migrate(app, db)
-
-# The import must be done after db initialization due to circular import issue
-from models import Restaurant, Review
-
-@app.route('/', methods=['GET'])
+@app.route('/')
 def index():
-    print('Request for index page received')
-    restaurants = Restaurant.query.all()
-    return render_template('index.html', restaurants=restaurants)
+    return 'Bienvenue dans l\'application Flask Azure B2C! <a href="/login">Se connecter</a>'
 
-@app.route('/<int:id>', methods=['GET'])
-def details(id):
-    restaurant = Restaurant.query.where(Restaurant.id == id).first()
-    reviews = Review.query.where(Review.restaurant == id)
-    return render_template('details.html', restaurant=restaurant, reviews=reviews)
+@app.route('/login')
+def login():
+    # Génère l'URL de connexion et redirige vers la page de connexion d'Azure B2C
+    session['state'] = str(uuid.uuid4())
+    fixed_code_challenge = 'YTFjNjI1OWYzMzA3MTI4ZDY2Njg5M2RkNmVjNDE5YmEyZGRhOGYyM2IzNjdmZWFhMTQ1ODg3NDcxY2Nl'
+    auth_url = msal_app.get_authorization_request_url(
+        scopes=[],
+        state=session['state'],
+        redirect_uri=url_for('authorized', _external=True, _scheme='https'))
+    # Ensuite, ajoutez manuellement le code_challenge à l'URL
+    auth_url += '&code_challenge={}'.format(fixed_code_challenge)
+    return redirect(auth_url)
 
-@app.route('/create', methods=['GET'])
-def create_restaurant():
-    print('Request for add restaurant page received')
-    return render_template('create_restaurant.html')
+@app.route('/getAToken')
+def authorized():
+    # La requête de retour de l'authentification Azure B2C
+    if request.args.get('state') != session.get("state"):
+        return redirect(url_for("index"))  # Aucune correspondance d'état; possible attaque CSRF
+    if 'error' in request.args:  # Si l'utilisateur a refusé la permission
+        return redirect(url_for("index"))
 
-@app.route('/add', methods=['POST'])
-@csrf.exempt
-def add_restaurant():
-    try:
-        name = request.values.get('restaurant_name')
-        street_address = request.values.get('street_address')
-        description = request.values.get('description')
-    except (KeyError):
-        # Redisplay the question voting form.
-        return render_template('add_restaurant.html', {
-            'error_message': "You must include a restaurant name, address, and description",
-        })
+    # Récupérer le token avec le code de la requête
+    cache = msal.SerializableTokenCache()
+    result = msal_app.acquire_token_by_authorization_code(
+        request.args['code'],
+        scopes=["openid", "profile"],  # Les scopes pour lesquels le token est requis
+        redirect_uri=url_for('authorized', _external=True, _scheme='https'),
+        cache=cache
+    )
+
+    if "id_token" in result:
+        # Succès, vous pouvez utiliser result['id_token'] pour obtenir les informations de l'utilisateur
+        session['user'] = result.get('id_token_claims')
+        return redirect(url_for("index"))
     else:
-        restaurant = Restaurant()
-        restaurant.name = name
-        restaurant.street_address = street_address
-        restaurant.description = description
-        db.session.add(restaurant)
-        db.session.commit()
-
-        return redirect(url_for('details', id=restaurant.id))
-
-@app.route('/review/<int:id>', methods=['POST'])
-@csrf.exempt
-def add_review(id):
-    try:
-        user_name = request.values.get('user_name')
-        rating = request.values.get('rating')
-        review_text = request.values.get('review_text')
-    except (KeyError):
-        #Redisplay the question voting form.
-        return render_template('add_review.html', {
-            'error_message': "Error adding review",
-        })
-    else:
-        review = Review()
-        review.restaurant = id
-        review.review_date = datetime.now()
-        review.user_name = user_name
-        review.rating = int(rating)
-        review.review_text = review_text
-        db.session.add(review)
-        db.session.commit()
-
-    return redirect(url_for('details', id=id))
-
-@app.context_processor
-def utility_processor():
-    def star_rating(id):
-        reviews = Review.query.where(Review.restaurant == id)
-
-        ratings = []
-        review_count = 0
-        for review in reviews:
-            ratings += [review.rating]
-            review_count += 1
-
-        avg_rating = sum(ratings) / len(ratings) if ratings else 0
-        stars_percent = round((avg_rating / 5.0) * 100) if review_count > 0 else 0
-        return {'avg_rating': avg_rating, 'review_count': review_count, 'stars_percent': stars_percent}
-
-    return dict(star_rating=star_rating)
-
-@app.route('/favicon.ico')
-def favicon():
-    return send_from_directory(os.path.join(app.root_path, 'static'),
-                               'favicon.ico', mimetype='image/vnd.microsoft.icon')
+        return f"Erreur d'authentification: {result.get('error_description')}"
 
 if __name__ == '__main__':
-    app.run()
+    app.run(ssl_context='adhoc')  # Utilisez ssl_context pour le https en local
